@@ -125,8 +125,6 @@ def test_clean_sdist_and_editable_builds_compile_java_readers(tmp_path):
         capture_output=True,
         text=True,
     )
-    output_dir = tmp_path / "reader-output"
-    output_dir.mkdir()
     environment = os.environ.copy()
     environment["PYTHONPATH"] = str(installed)
     subprocess.run(
@@ -136,15 +134,13 @@ def test_clean_sdist_and_editable_builds_compile_java_readers(tmp_path):
             (
                 "import pathlib, sys; "
                 "from actipy import reader; "
-                "assert pathlib.Path(sys.argv[3]).resolve() in "
+                "assert pathlib.Path(sys.argv[2]).resolve() in "
                 "pathlib.Path(reader.__file__).resolve().parents; "
-                "arrays, info = reader._java_read_device_stream("
-                "sys.argv[1], sys.argv[2], verbose=False); "
+                "arrays, info = reader._read_device_columns(sys.argv[1]); "
                 "assert len(arrays['time']) > 0; "
                 "assert info['ReadOK'] == 1"
             ),
             str(FIXTURE),
-            str(output_dir),
             str(installed),
         ],
         cwd=tmp_path,
