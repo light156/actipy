@@ -2,7 +2,6 @@ PRE2026_PINS := \
 	"numpy<=2.3.5" \
 	"scipy<=1.16.3" \
 	"pandas<=2.3.3" \
-	"statsmodels<=0.14.6" \
 	"tqdm<=4.67.1" \
 	"ruff<=0.14.10" \
 	"autopep8<=2.3.2" \

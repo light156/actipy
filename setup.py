@@ -58,7 +58,6 @@ setuptools.setup(
         "numpy>=1.22",
         "scipy>=1.7",
         "pandas>=1.3",
-        "statsmodels>=0.13",
         "tqdm"
     ],
     extras_require={
