@@ -190,7 +190,8 @@ class _BlockTable:
         table.count = count
         table.start = start
         table.end = end
-        table.inverse_unit = np.ldexp(np.float32(1), -(8 + ((raw_light >> 13) & 7))).astype(np.float32)
+        # 1 / 2^(8 + code), exact in float32 (no ldexp: it lacks int64 loops on Windows)
+        table.inverse_unit = np.float32(1) / (1 << (8 + ((raw_light >> 13) & 7))).astype(np.float32)
         table.gyroscope_unit = (
             np.float32(32768.0)
             / np.where(gyroscope_code != 0, 8000 // (1 << gyroscope_code), 2000).astype(np.float32)

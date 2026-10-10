@@ -21,7 +21,7 @@ def test_nearest_indexer_matches_pandas_get_indexer(unit, tz):
     tolerance = pd.Timedelta("1s")
     for _ in range(50):
         # ~100 Hz with jitter, gaps of a few samples up to minutes, exact hits
-        steps = rng.choice([10, 10, 9, 11, 30, 2500, 120_000], size=400) * 1_000_000
+        steps = rng.choice(np.array([10, 10, 9, 11, 30, 2500, 120_000], dtype=np.int64), size=400) * 1_000_000
         source = _index(1_700_000_000_000_000_000 + np.cumsum(steps), unit, tz)
         start = source[0] + pd.Timedelta(int(rng.integers(0, 5000)), "ms")
         target = pd.date_range(start, periods=int(rng.integers(1, 300)), freq="10ms")
