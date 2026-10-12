@@ -50,6 +50,8 @@ module = [
     "pandas.*",
     "scipy",
     "scipy.*",
+    "statsmodels",
+    "statsmodels.*",
     "tqdm",
     "tqdm.*",
 ]

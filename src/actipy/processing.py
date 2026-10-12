@@ -40,6 +40,7 @@ from typing import Any, Callable, Dict, Iterator, Optional, Tuple, Union, cast
 import numpy as np
 import pandas as pd
 import scipy.signal as signal
+import statsmodels.api as sm
 from numpy.typing import NDArray
 
 __all__ = ['quality_control', 'lowpass', 'calibrate_gravity', 'flag_nonwear', 'find_nonwear_segments', 'resample']
@@ -109,9 +110,8 @@ def _index_from_ns(
     else:
         unit = 'ns'
     result = pd.DatetimeIndex(
-        ticks.view(f'datetime64[{unit}]'),  # same bits; astype would copy
+        ticks.astype(f'datetime64[{unit}]', copy=False),
         name=template.name,
-        copy=False,  # ``values`` is private to the caller
     )
     if template.tz is not None:
         result = result.tz_localize('UTC').tz_convert(template.tz)
@@ -391,35 +391,6 @@ def _multiply_in_output_dtype(
     np.multiply(output, factor, out=output)
 
 
-def _pinv_extended(x: Array, rcond: float = 1e-15) -> Array:
-    """statsmodels.tools.tools.pinv_extended, operation for operation."""
-
-    x = np.asarray(x)
-    x = x.conjugate()
-    u, s, vt = np.linalg.svd(x, False)
-    m = u.shape[0]
-    n = vt.shape[1]
-    cutoff = rcond * np.maximum.reduce(s)
-    for i in range(min(n, m)):
-        if s[i] > cutoff:
-            s[i] = 1.0 / s[i]
-        else:
-            s[i] = 0.0
-    return cast(Array, np.dot(np.transpose(vt), np.multiply(s[:, np.newaxis], np.transpose(u))))
-
-
-def _wls_params(endog: Array, exog: Array, weights: Array) -> Array:
-    """``sm.WLS(endog, exog, weights=weights).fit().params``, without statsmodels.
-
-    Repeats the exact whitening and pseudo-inverse arithmetic of the pinv fit.
-    """
-
-    weights = np.array(weights).squeeze()
-    wexog = np.sqrt(weights)[:, None] * np.asarray(exog)
-    wendog = np.asarray(endog) * np.sqrt(weights)
-    return cast(Array, np.dot(_pinv_extended(wexog), wendog))
-
-
 def _window_statistics(
     data: pd.DataFrame,
     columns: Tuple[str, ...],
@@ -591,44 +562,6 @@ def quality_control(data: pd.DataFrame, sample_rate: float) -> Tuple[pd.DataFram
     return data, info
 
 
-def _nearest_indexer(
-    index: pd.DatetimeIndex,
-    target: pd.DatetimeIndex,
-    tolerance: pd.Timedelta,
-) -> NDArray[np.intp]:
-    """``index.get_indexer(target, 'nearest', tolerance, limit=1)``, bounded.
-
-    pandas' pad/backfill scans start from the ends of the whole index, so one
-    call per chunk is quadratic overall. For a strictly increasing index, only
-    the neighbouring samples of the (sorted) chunk can be matched, so the same
-    pandas lookup runs on that slice and the positions are shifted back.
-    """
-
-    if not (
-        len(target)
-        and index.is_monotonic_increasing
-        and index.is_unique
-        and target.is_monotonic_increasing
-    ):
-        return cast(NDArray[np.intp], index.get_indexer(
-            target, method='nearest', tolerance=tolerance, limit=1
-        ))
-    # Slice bounds in integer ticks (any unit), widened by one sample: extra
-    # context outside the chunk never changes pad/backfill/nearest decisions.
-    times = index.asi8
-    index_scale = _timestamp_scale(index)
-    target_scale = _timestamp_scale(target)
-    first_ns = int(target.asi8[0]) * target_scale
-    last_ns = int(target.asi8[-1]) * target_scale
-    lo = max(int(np.searchsorted(times, first_ns // index_scale, side='right')) - 2, 0)
-    hi = min(int(np.searchsorted(times, -(-last_ns // index_scale), side='left')) + 2, len(index))
-    indexer = index[lo:hi].get_indexer(
-        target, method='nearest', tolerance=tolerance, limit=1
-    )
-    indexer[indexer >= 0] += lo
-    return cast(NDArray[np.intp], indexer)
-
-
 def resample(  # noqa: C901
     data: pd.DataFrame,
     sample_rate: float,
@@ -714,7 +647,9 @@ def resample(  # noqa: C901
             periods=chunk_size,
             name=data.index.name,
         )
-        indexer = _nearest_indexer(data.index, t, tolerance)
+        indexer = data.index.get_indexer(
+            t, method='nearest', tolerance=tolerance, limit=1
+        )
         missing = indexer < 0
         has_missing = missing.any()
         if has_missing:
@@ -1001,9 +936,14 @@ def calibrate_gravity(  # noqa: C901
             out = target[:, k]
             if hasT:
                 inp = np.column_stack((inp, T))
-            # sm.add_constant(inp, prepend=True, has_constant='add')
-            inp = np.column_stack([np.ones(inp.shape[0]), inp if inp.ndim == 2 else inp[:, None]])
-            params = _wls_params(out, inp, weights)
+            inp = cast(
+                Array,
+                sm.add_constant(inp, prepend=True, has_constant='add'),
+            )
+            params = cast(
+                NDArray[np.float64],
+                sm.WLS(out, inp, weights=weights).fit().params,
+            )
             # In the following,
             # intercept == params[0]
             # slope == params[1]
