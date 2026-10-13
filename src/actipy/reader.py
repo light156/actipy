@@ -17,7 +17,8 @@ Main Functions
 read_device : Read device file and apply processing pipeline
 process : Apply processing pipeline to existing DataFrame
 
-Each device type has its own NumPy-based parser. All parsers output data in a
+Each device type has its own parser: vectorized NumPy for Axivity, ActiGraph and
+GENEActiv, and ``struct``-based Python for Matrix. All parsers output data in a
 consistent pandas DataFrame format with a DateTimeIndex.
 
 Notes

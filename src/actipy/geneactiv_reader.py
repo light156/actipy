@@ -2,12 +2,13 @@
 GENEActiv (.bin) reader.
 
 Decodes the text pages of a GENEActiv file with vectorized NumPy operations
-and returns exactly the values of the former Java reader
-(``GENEActivReader.java``).
+and returns the values of the former Java reader (``GENEActivReader.java``).
+The tests compare the results with the Java reader's on real-device fixtures
+and edge cases.
 
 The file is streamed in windows of whole lines. Pages in the canonical layout
 are parsed in bulk; any other page goes through a line-by-line port of the
-Java page parser, so unusual files are handled exactly as before.
+Java page parser.
 """
 
 from __future__ import annotations
@@ -26,6 +27,8 @@ from actipy._reader_support import (
     ReadResult,
     epoch_seconds,
     high_12_bits,
+    java_arithmetic,
+    java_long,
     java_trim,
     low_12_bits,
     millis_to_nanos,
@@ -59,7 +62,8 @@ _HEADER_FIELDS = {47: 'x gain', 48: 'x offset', 49: 'y gain', 50: 'y offset', 51
 def read(path: str) -> ReadResult:
     """Read an uncompressed GENEActiv .bin file into columns and reader metadata."""
 
-    return _Reader(os.path.getsize(path)).read(path)
+    with java_arithmetic():
+        return _Reader(os.path.getsize(path)).read(path)
 
 
 class _Reader:
@@ -167,7 +171,7 @@ class _Reader:
         offsets = np.arange(SAMPLES_PER_PAGE) * 1000.0
         sample_millis = offsets[None, :] / sample_rate[selected, None] + start_millis[selected, None].astype(np.float64)
         times = self.columns['time'][first:stop].view(np.int64).reshape(-1, SAMPLES_PER_PAGE)
-        np.copyto(times, sample_millis, casting='unsafe')
+        times[...] = java_long(sample_millis)
         millis_to_nanos(times)
         self.columns['temperature'][first:stop] = np.repeat(
             temperature[selected].astype(np.float32), SAMPLES_PER_PAGE

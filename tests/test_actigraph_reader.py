@@ -1,5 +1,7 @@
+import logging
 import operator
 import struct
+import warnings
 import zipfile
 from functools import reduce
 
@@ -412,8 +414,67 @@ def test_actigraph_reader_rejects_truncated_packet_without_fabricating_samples(
         actigraph_reader(input_file)
 
 
+@pytest.mark.parametrize("scale", ["0x1p1024", "-0x1p1024", "0x1.fffffffffffff8p1023"])
+def test_actigraph_reader_falls_back_to_device_scale_when_scale_overflows(
+        actigraph_reader, tmp_path, caplog, scale):
+    # Java's Double.parseDouble returns +-Infinity for an overflowing hexadecimal value (the
+    # last one overflows only after rounding), so the scale is ignored as invalid and the MOS
+    # serial's default of 256 is used, rather than the read being aborted.
+    input_file = tmp_path / "overflowing-scale.gt3x"
+    payload = struct.pack("<hhhhhh", 256, -256, 128, -512, 64, -128)
+    _write_gt3x_v2(
+        input_file,
+        _actigraph_metadata(4, scale),
+        [_actigraph_packet(1_700_000_000, payload)],
+    )
+
+    with caplog.at_level(logging.WARNING, logger="actipy"):
+        data, info = actigraph_reader(input_file)
+
+    assert "Ignoring invalid Acceleration Scale" in caplog.text
+    np.testing.assert_array_equal(
+        np.column_stack((data["x"], data["y"], data["z"])),
+        [[1.0, -1.0, 0.5], [-2.0, 0.25, -0.5]],
+    )
+    assert info["ReadErrors"] == 0
+
+
+_LONG_MAX, _LONG_MIN = 2**63 - 1, -(2**63)
+
+
+@pytest.mark.parametrize(
+    ("version", "expected_nanos"),
+    [
+        # firstSampleTime (0 here) + Math.round(1e19): Math.round saturates at Long.MAX_VALUE
+        (1, [0, _LONG_MAX]),
+        # timestamp * 1000 + Math.round(1e19) wraps around as a Java long; toNanos then saturates
+        (2, [1_700_000_000 * 1_000_000_000, _LONG_MIN]),
+    ],
+)
+def test_actigraph_reader_saturates_timestamps_like_java_at_extreme_sample_rate(
+        actigraph_reader, tmp_path, version, expected_nanos):
+    # A sample rate of 1e-16 Hz puts the second sample 1e19 ms after the first, beyond the long
+    # range. The expected times are the Java reader's output for these files. Converting them must
+    # not warn either (NumPy warns on out-of-range float-to-int casts).
+    input_file = tmp_path / f"extreme-rate-v{version}.gt3x"
+    metadata = _actigraph_metadata(1e-16, 256)
+    if version == 1:
+        _write_gt3x_v1(input_file, metadata, _pack_12_bit_pair((256, -256, 128), (-512, 64, -128)))
+    else:
+        payload = struct.pack("<hhhhhh", 256, -256, 128, -512, 64, -128)
+        _write_gt3x_v2(input_file, metadata, [_actigraph_packet(1_700_000_000, payload)])
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        data, info = actigraph_reader(input_file)
+
+    np.testing.assert_array_equal(data["time"].view("int64"), expected_nanos)
+    np.testing.assert_array_equal(data["x"], [1.0, -2.0])
+    assert info["ReadErrors"] == 0
+
+
 def test_actigraph_reader_keeps_samples_before_truncated_trailing_packet(
-        actigraph_reader, tmp_path):
+        actigraph_reader, tmp_path, caplog):
     input_file = tmp_path / "truncated-tail.gt3x"
     valid = _actigraph_packet(
         1_700_000_000,
@@ -429,9 +490,10 @@ def test_actigraph_reader_keeps_samples_before_truncated_trailing_packet(
         [valid, truncated],
     )
 
-    with pytest.warns(UserWarning, match="Stopping at truncated GT3X data"):
+    with caplog.at_level(logging.WARNING, logger="actipy"):
         data, info = actigraph_reader(input_file)
 
+    assert "Stopping at truncated GT3X data" in caplog.text
     np.testing.assert_array_equal(data["x"], [1.0])
     assert info == {
         "ReadOK": 1,

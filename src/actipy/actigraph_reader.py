@@ -2,8 +2,10 @@
 ActiGraph (.gt3x) reader.
 
 Decodes V1 (``activity.bin``) and V2 (``log.bin``) archives with vectorized
-NumPy operations and returns exactly the values of the former Java reader
-(``ActigraphReader.java``), including Java's ``Math.round`` semantics.
+NumPy operations and returns the values of the former Java reader
+(``ActigraphReader.java``), using Java's ``Math.round`` rounding and its
+saturating conversion to ``long``. The tests compare the results with the
+Java reader's on real-device fixtures and edge cases.
 """
 
 from __future__ import annotations
@@ -24,6 +26,8 @@ from actipy._reader_support import (
     FormatError,
     ReadResult,
     high_12_bits,
+    java_arithmetic,
+    java_long,
     java_trim,
     low_12_bits,
     millis_to_nanos,
@@ -60,7 +64,7 @@ def read(path: str) -> ReadResult:
     """Read a .gt3x archive into columns and reader metadata."""
 
     try:
-        with zipfile.ZipFile(path) as archive:
+        with java_arithmetic(), zipfile.ZipFile(path) as archive:
             names = set(archive.namelist())
             if 'info.txt' in names and 'activity.bin' in names and 'lux.bin' in names:
                 version, member = 1, 'activity.bin'
@@ -162,7 +166,11 @@ def _decode_parameter(value: int) -> float:
 
 
 def _java_round(values: NDArray[np.float64]) -> NDArray[np.float64]:
-    """``Math.round`` for finite doubles: exact ``floor(x + 0.5)``."""
+    """``Math.round`` before its conversion to ``long``: exact ``floor(x + 0.5)``.
+
+    NaN and infinities pass through; ``java_long`` then gives Java's ``long`` result
+    (NaN to 0, saturating at the int64 limits).
+    """
 
     rounded = np.floor(values)
     rounded += (values - rounded) >= 0.5
@@ -240,7 +248,7 @@ def _write_v1(
     offsets *= 1000.0
     offsets /= metadata.sample_rate
     times = output.time[first:first + count]
-    np.copyto(times, _java_round(offsets), casting='unsafe')
+    times[...] = java_long(_java_round(offsets))
     times += metadata.first_millis
     millis_to_nanos(times)
     samples = _packed_fields(data, pairs)
@@ -364,7 +372,7 @@ def _write_v2(output: _Output, data: bytes, starts: NDArray[np.int64], state: _V
     first_row = output.rows + np.concatenate(([0], np.cumsum(counts)[:-1]))
     longest = int(counts.max())
     # timestamp * 1000 + Math.round(1000d * sampleIndex / sampleRate)
-    offset_millis = _java_round(1000.0 * np.arange(longest, dtype=np.float64) / state.sample_rate).astype(np.int64)
+    offset_millis = java_long(_java_round(1000.0 * np.arange(longest, dtype=np.float64) / state.sample_rate))
 
     # Packets with the same type, size and scale decode together as one 2-D block.
     keys = np.stack([kinds.astype(np.float64), sizes.astype(np.float64), scale[activity]], axis=1)

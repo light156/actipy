@@ -1,16 +1,29 @@
 """
 Shared helpers for the device readers.
 
-The readers reproduce the former Java parsers bit for bit, so these helpers
-mirror Java semantics where Python differs: number parsing, saturating
-millisecond-to-nanosecond conversion, and proleptic calendar validation.
+The readers replace the former Java parsers and aim to return the same values: the real-device
+test fixtures match the Java output byte for byte, and the tests check edge cases against Java's
+results. These helpers mirror Java semantics where Python differs: number parsing, saturating
+float-to-long and millisecond-to-nanosecond conversion, silent IEEE floating-point arithmetic, and
+proleptic calendar validation.
+
+Known, intentional differences from the Java readers:
+
+- Integer fields accept ASCII digits only; Java's ``Long.parseLong`` also accepts other Unicode
+  decimal digits (e.g. fullwidth digits).
+- A .gt3x archive member whose CRC does not match is rejected; the Java reader read it anyway.
+- When several packets are malformed, the error reported may come from a later packet than the
+  one the Java reader reported.
+- Unreadable files raise ``FormatError`` (a ``ValueError``), where the Java reader's process
+  failed and ``subprocess.CalledProcessError`` was raised.
 """
 
 from __future__ import annotations
 
+import logging
+import math
 import re
-import warnings
-from typing import Any, Dict, Tuple, Union, cast
+from typing import Any, ContextManager, Dict, Tuple, Union, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -21,14 +34,18 @@ ReadInfo = Dict[str, Union[int, float]]
 ReadResult = Tuple[Columns, ReadInfo]
 
 _INT64_MAX = 2**63 - 1
+_TWO_TO_63 = 2.0**63
 _MAX_MILLIS = _INT64_MAX // 1_000_000
 _DAYS_IN_MONTH = np.array([31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31], dtype=np.int64)
 _DAYS_BEFORE_MONTH = np.concatenate(([0], np.cumsum(_DAYS_IN_MONTH)[:-1]))
 
-_DECIMAL = re.compile(r'[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?[fFdD]?')
-_HEXADECIMAL = re.compile(r'[+-]?0[xX](?:[0-9a-fA-F]+\.?[0-9a-fA-F]*|\.[0-9a-fA-F]+)[pP][+-]?\d+[fFdD]?')
+# re.ASCII: Java's Double.parseDouble accepts ASCII digits only, unlike float() and str-pattern \d
+_DECIMAL = re.compile(r'[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?[fFdD]?', re.ASCII)
+_HEXADECIMAL = re.compile(r'[+-]?0[xX](?:[0-9a-fA-F]+\.?[0-9a-fA-F]*|\.[0-9a-fA-F]+)[pP][+-]?\d+[fFdD]?', re.ASCII)
 _SPECIAL = re.compile(r'[+-]?(?:NaN|Infinity)')
 _INTEGER = re.compile(r'[+-]?[0-9]+')
+
+_LOGGER = logging.getLogger('actipy')
 
 
 class FormatError(ValueError):
@@ -36,9 +53,42 @@ class FormatError(ValueError):
 
 
 def warn(message: str) -> None:
-    """Report a recoverable problem (formerly printed by the Java readers)."""
+    """Report a recoverable problem (formerly printed to stderr by the Java readers).
 
-    warnings.warn(message, stacklevel=3)
+    Logged rather than raised with ``warnings.warn``: a warnings filter set to "error" would turn
+    the message into an exception and discard the samples read so far, whereas the reader is
+    meant to recover. Problems with the recorded data (skipped blocks, packets or pages,
+    truncation, a page count that differs from the header) are also counted in ``ReadErrors``;
+    metadata fallbacks, such as ignoring an invalid acceleration scale, are not. Without logging
+    configuration, the message goes to stderr, as the Java readers' did.
+    """
+
+    _LOGGER.warning(message)
+
+
+def java_arithmetic() -> ContextManager[Any]:
+    """Floating-point errors as in Java: IEEE results (inf, nan) without warnings or exceptions.
+
+    NumPy warns, or raises under ``np.errstate(all='raise')``, on overflow and invalid operations,
+    including in values that are never used (e.g. calibration table entries for codes absent from
+    a file). The readers run inside this context so that the caller's settings cannot abort a read
+    that Java completed.
+    """
+
+    return np.errstate(all='ignore')
+
+
+def java_long(values: Array) -> NDArray[np.int64]:
+    """``(long) value`` for doubles: truncate toward zero, saturate at the int64 limits, NaN to 0."""
+
+    values = np.asarray(values, dtype=np.float64)
+    if values.size and -_TWO_TO_63 < values.min() and values.max() < _TWO_TO_63:  # False if any NaN
+        return values.astype(np.int64)  # the usual case: every value in range, a plain truncation
+    in_range = np.abs(values) < _TWO_TO_63  # False for NaN and +-Infinity
+    result = np.where(in_range, values, 0.0).astype(np.int64)
+    result[values >= _TWO_TO_63] = _INT64_MAX
+    result[values <= -_TWO_TO_63] = -_INT64_MAX - 1
+    return cast(NDArray[np.int64], result)
 
 
 def java_trim(text: str) -> str:
@@ -53,7 +103,7 @@ def java_trim(text: str) -> str:
 
 
 def parse_double(text: str) -> float:
-    """``Double.parseDouble``, which accepts a different syntax than ``float``."""
+    """``Double.parseDouble``, which accepts a different syntax than ``float`` (ASCII digits only)."""
 
     text = java_trim(text)
     if _DECIMAL.fullmatch(text):
@@ -63,7 +113,10 @@ def parse_double(text: str) -> float:
     if _HEXADECIMAL.fullmatch(text):
         body = text.rstrip('fFdD')
         sign = -1.0 if body.startswith('-') else 1.0
-        return sign * float.fromhex(body.lstrip('+-'))
+        try:
+            return sign * float.fromhex(body.lstrip('+-'))
+        except OverflowError:  # Java returns +-Infinity, as float() already does for decimals
+            return sign * math.inf
     raise ValueError(f"Invalid number: {text!r}")
 
 
@@ -77,13 +130,13 @@ def _parse_integer(text: str, bits: int) -> int:
 
 
 def parse_int(text: str) -> int:
-    """``Integer.parseInt``."""
+    """``Integer.parseInt`` for ASCII digits (Java also accepts other Unicode decimal digits)."""
 
     return _parse_integer(text, 32)
 
 
 def parse_long(text: str) -> int:
-    """``Long.parseLong``."""
+    """``Long.parseLong`` for ASCII digits (Java also accepts other Unicode decimal digits)."""
 
     return _parse_integer(text, 64)
 

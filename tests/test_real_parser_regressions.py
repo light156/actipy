@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -90,7 +91,7 @@ def test_real_device_numerical_regression(fixture_spec):
     assert info["SampleRate"] == fixture_spec["sample_rate"]
 
 
-def test_axivity_reader_returns_data_before_truncated_tail(tmp_path):
+def test_axivity_reader_returns_data_before_truncated_tail(tmp_path, caplog):
     source = FIXTURE_DIR / "axivity-ax3.cwa"
     input_file = tmp_path / "truncated-tail.cwa"
     source_bytes = source.read_bytes()
@@ -101,9 +102,10 @@ def test_axivity_reader_returns_data_before_truncated_tail(tmp_path):
     )
     input_file.write_bytes(data_block + b"AX")
 
-    with pytest.warns(UserWarning, match="Unexpected partial CWA block"):
+    with caplog.at_level(logging.WARNING, logger="actipy"):
         data, info = axivity_reader.read(str(input_file))
 
+    assert "Unexpected partial CWA block" in caplog.text
     assert len(data["time"]) > 0
     assert info["ReadOK"] == 1
     assert info["ReadErrors"] == 1

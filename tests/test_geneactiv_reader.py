@@ -1,3 +1,5 @@
+import logging
+import warnings
 from datetime import datetime, timezone
 
 import numpy as np
@@ -238,6 +240,9 @@ def test_geneactiv_reader_preserves_sample_stride_with_lowercase_auxiliary_bits(
     [
         (3, "Page Time:not-a-time"),
         (5, "Temperature:not-a-number"),
+        # Java parses an overflowing hexadecimal value as +-Infinity, which is not a finite temperature
+        (5, "Temperature:0x1p1024"),
+        (5, "Temperature:-0x1p1024"),
         (8, "Measurement Frequency:0"),
     ],
 )
@@ -276,9 +281,47 @@ def test_geneactiv_reader_skips_page_with_invalid_header_without_reusing_state(
     }
 
 
+def test_geneactiv_reader_saturates_timestamps_like_java_at_extreme_sample_rate(
+        geneactiv_reader, tmp_path):
+    # At 1e-16 Hz every sample after the first lies beyond the long range of milliseconds:
+    # Java's (long) cast saturates and toNanos keeps Long.MAX_VALUE (the Java reader's output).
+    input_file = tmp_path / "extreme-rate.bin"
+    block = _geneactiv_block(
+        0, "2024-01-02 03:04:05:000", 20, "1e-16", _full_page_payload(_encode_sample(1, 2, 3))
+    )
+    _write_geneactiv(input_file, (100, 100, 100), (0, 0, 0), [block])
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        data, info = geneactiv_reader(input_file)
+
+    times = data["time"].view("int64")
+    assert times[0] == datetime(2024, 1, 2, 3, 4, 5, tzinfo=timezone.utc).timestamp() * 1_000_000_000
+    assert (times[1:] == 2**63 - 1).all()
+    assert info["ReadErrors"] == 0
+
+
+def test_geneactiv_reader_calibration_does_not_signal_for_codes_absent_from_file(
+        geneactiv_reader, tmp_path):
+    # Calibration is tabulated for all 4,096 codes. With a tiny gain the unused codes overflow
+    # float32; Java computes only the samples present (all zero here) and returns zeros without
+    # signalling, whatever the caller's warning or floating-point settings.
+    input_file = tmp_path / "tiny-gain.bin"
+    block = _geneactiv_block(0, "2024-01-02 03:04:05:000", 20, 100, _full_page_payload())
+    _write_geneactiv(input_file, ("1e-34", 100, 100), (0, 0, 0), [block])
+
+    with warnings.catch_warnings(), np.errstate(all="raise"):
+        warnings.simplefilter("error")
+        data, info = geneactiv_reader(input_file)
+
+    for axis in ("x", "y", "z"):
+        np.testing.assert_array_equal(data[axis], np.zeros(300, dtype=np.float32))
+    assert info["ReadErrors"] == 0
+
+
 @pytest.mark.parametrize("declared_page_count", [0, 2])
 def test_geneactiv_reader_keeps_data_when_page_count_differs_from_header(
-        geneactiv_reader, tmp_path, declared_page_count):
+        geneactiv_reader, tmp_path, caplog, declared_page_count):
     input_file = tmp_path / "page-count-mismatch.bin"
     payload = _encode_sample(1, 2, 3) * 300
     blocks = [
@@ -298,9 +341,10 @@ def test_geneactiv_reader_keeps_data_when_page_count_differs_from_header(
         declared_page_count=declared_page_count,
     )
 
-    with pytest.warns(UserWarning, match="page count differs from header"):
+    with caplog.at_level(logging.WARNING, logger="actipy"):
         data, info = geneactiv_reader(input_file)
 
+    assert "page count differs from header" in caplog.text
     assert data["time"].shape == (300,)
     assert info == {
         "ReadOK": 1,
@@ -310,7 +354,7 @@ def test_geneactiv_reader_keeps_data_when_page_count_differs_from_header(
 
 
 def test_geneactiv_reader_keeps_complete_page_before_truncated_page(
-        geneactiv_reader, tmp_path):
+        geneactiv_reader, tmp_path, caplog):
     input_file = tmp_path / "truncated-page.bin"
     complete = _geneactiv_block(
         0,
@@ -324,9 +368,10 @@ def test_geneactiv_reader_keeps_complete_page_before_truncated_page(
     lines.extend(["Recorded Data", "Device Unique Serial Code:012345"])
     input_file.write_text("\n".join(lines) + "\n", encoding="ascii")
 
-    with pytest.warns(UserWarning, match="Stopping at truncated GENEActiv data"):
+    with caplog.at_level(logging.WARNING, logger="actipy"):
         data, info = geneactiv_reader(input_file)
 
+    assert "Stopping at truncated GENEActiv data" in caplog.text
     assert data["time"].shape == (300,)
     assert info == {
         "ReadOK": 1,
@@ -358,7 +403,7 @@ def test_geneactiv_reader_rejects_matching_count_with_no_valid_pages(
 
 @pytest.mark.parametrize("sample_count", [0, 299])
 def test_geneactiv_reader_rejects_whole_sample_page_truncation(
-        geneactiv_reader, tmp_path, sample_count):
+        geneactiv_reader, tmp_path, caplog, sample_count):
     input_file = tmp_path / f"truncated-{sample_count}.bin"
     truncated = _geneactiv_block(
         0,
@@ -374,9 +419,11 @@ def test_geneactiv_reader_rejects_whole_sample_page_truncation(
         [truncated],
     )
 
-    with pytest.warns(UserWarning, match="expected 3600 hexadecimal characters"), \
+    with caplog.at_level(logging.WARNING, logger="actipy"), \
             pytest.raises(FormatError, match="No valid GENEActiv pages were decoded"):
         geneactiv_reader(input_file)
+
+    assert "expected 3600 hexadecimal characters" in caplog.text
 
 
 def test_geneactiv_reader_rejects_truncated_file_header(

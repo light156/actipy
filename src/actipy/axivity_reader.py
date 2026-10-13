@@ -2,8 +2,9 @@
 Axivity AX3/AX6 (.cwa) reader.
 
 Decodes the 512-byte CWA blocks with vectorized NumPy operations and returns
-exactly the values of the former Java reader (``AxivityReader.java``): the
-float arithmetic follows the same single/double precision steps.
+the values of the former Java reader (``AxivityReader.java``): the float
+arithmetic follows the same single/double precision steps. The tests compare
+the results with the Java reader's on real-device fixtures and edge cases.
 
 The file is read twice in fixed-size chunks: first for block headers and
 checksums (small per-block arrays), then for the samples, which are written
@@ -25,6 +26,8 @@ from actipy._reader_support import (
     FormatError,
     ReadResult,
     epoch_seconds,
+    java_arithmetic,
+    java_long,
     millis_to_nanos,
     read_info,
     warn,
@@ -48,7 +51,7 @@ def read(path: str) -> ReadResult:
 
     size = os.path.getsize(path)
     num_blocks, partial = divmod(size, BLOCK_SIZE)
-    with open(path, 'rb') as stream:
+    with java_arithmetic(), open(path, 'rb') as stream:
         headers, checksums = _read_headers(stream, num_blocks)
         blocks = _BlockTable.parse(headers, checksums)
         if blocks.total_samples == 0 and partial:
@@ -63,7 +66,9 @@ def read(path: str) -> ReadResult:
 
 
 def _read_exact(stream: BufferedReader, buffer: NDArray[np.uint8]) -> None:
-    view = memoryview(cast(bytearray, buffer))
+    """Fill ``buffer`` completely, reading as often as needed; raise if the file ends first."""
+
+    view = memoryview(cast(bytearray, buffer)).cast('B')  # flat bytes: len() and slices count bytes, not rows
     filled = 0
     while filled < len(view):
         count = stream.readinto(view[filled:])
@@ -93,6 +98,7 @@ class _BlockTable:
         self.index: NDArray[np.intp] = np.empty(0, dtype=np.intp)
         self.has_gyroscope = False
         self.packing: NDArray[np.int64] = np.empty(0, dtype=np.int64)
+        self.num_axes: NDArray[np.int64] = np.empty(0, dtype=np.int64)
         self.count: NDArray[np.int64] = np.empty(0, dtype=np.int64)
         self.start: NDArray[np.float64] = np.empty(0)
         self.end: NDArray[np.float64] = np.empty(0)
@@ -121,7 +127,7 @@ class _BlockTable:
         bytes_per_sample = np.where(
             packing == 2, 2 * num_axes, np.where((packing == 0) & (num_axes == 3), 4, 0)
         )
-        timestamp_offset = words[:, 13].view(np.int16)
+        timestamp_offset = words[:, 13].view('<i2')  # little-endian like ``words``, on any host
         with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
             sample_rate = np.where(
                 rate_code == 0,
@@ -187,6 +193,7 @@ class _BlockTable:
         table.index = index
         table.has_gyroscope = bool(six_axes[0])
         table.packing = packing[index]
+        table.num_axes = num_axes[index]
         table.count = count
         table.start = start
         table.end = end
@@ -236,21 +243,22 @@ def _read_samples(stream: BufferedReader, num_blocks: int, blocks: _BlockTable) 
             sample_times /= counts[:, None]
         sample_times += blocks.start[lo:hi, None]
         sample_times *= 1000.0
-        with np.errstate(invalid='ignore'):
-            millis = sample_times.astype(np.int64)
+        millis = java_long(sample_times)  # (long) (time * 1000), saturating like Java
         millis = millis.reshape(-1) if mask is None else millis[mask]
         times[rows_out] = millis_to_nanos(millis)
 
         payload = np.ascontiguousarray(data[:, HEADER_SIZE:HEADER_SIZE + PAYLOAD_SIZE])
-        packing = blocks.packing[lo:hi]
+        # Blocks are decoded in groups sharing one packing and one declared axis count (both
+        # 4-bit header fields), which together fix the sample layout and stride.
+        layout = blocks.packing[lo:hi] * 16 + blocks.num_axes[lo:hi]
         values: Dict[str, Array]
-        if (packing == packing[0]).all():
-            values = _decode(payload, int(packing[0]), width, blocks, lo, hi)
-        else:  # packed and unpacked AX3 blocks may be mixed
+        if (layout == layout[0]).all():
+            values = _decode(payload, int(blocks.packing[lo]), int(blocks.num_axes[lo]), width, blocks, lo, hi)
+        else:  # e.g. packed and unpacked AX3 blocks, or 6- and 9-axis blocks, in one file
             values = {name: np.zeros((hi - lo, width), dtype=np.float32) for name in names}
-            for value in np.unique(packing):
-                selected = packing == value
-                part = _decode(payload[selected], int(value), width, blocks, lo, hi, selected)
+            for key in np.unique(layout):
+                selected = layout == key
+                part = _decode(payload[selected], int(key // 16), int(key % 16), width, blocks, lo, hi, selected)
                 for name, decoded in part.items():
                     values[name][selected, :decoded.shape[1]] = decoded
         values['temperature'] = np.broadcast_to(blocks.temperature[lo:hi, None], (hi - lo, width))
@@ -268,13 +276,14 @@ def _read_samples(stream: BufferedReader, num_blocks: int, blocks: _BlockTable) 
 def _decode(
     payload: NDArray[np.uint8],
     packing: int,
+    num_axes: int,
     width: int,
     blocks: _BlockTable,
     lo: int,
     hi: int,
     selected: Optional[NDArray[np.bool_]] = None,
 ) -> Dict[str, Array]:
-    """Decode up to ``width`` samples per block for blocks sharing one packing."""
+    """Decode up to ``width`` samples per block for blocks sharing one packing and axis count."""
 
     inverse_unit = blocks.inverse_unit[lo:hi]
     gyroscope_unit = blocks.gyroscope_unit[lo:hi]
@@ -292,12 +301,14 @@ def _decode(
             field <<= exponent
             values[name] = field.astype(np.float32) * scale
         return values
+    # Unpacked samples are ``num_axes`` 16-bit values each, as declared in the block header:
+    # gyroscope x, y, z first if present, then acceleration x, y, z. Any further axes (e.g. a
+    # magnetometer in 9-axis blocks) are skipped, as in the Java reader.
     words = payload.view('<i2')
-    axes = 6 if blocks.has_gyroscope else 3
     first_axis = 3 if blocks.has_gyroscope else 0
     for axis, name in enumerate(('x', 'y', 'z')):
-        values[name] = words[:, first_axis + axis::axes][:, :width].astype(np.float32) * scale
+        values[name] = words[:, first_axis + axis::num_axes][:, :width].astype(np.float32) * scale
     if blocks.has_gyroscope:
         for axis, name in enumerate(('gyro_x', 'gyro_y', 'gyro_z')):
-            values[name] = words[:, axis::axes][:, :width].astype(np.float32) / gyroscope_unit[:, None]
+            values[name] = words[:, axis::num_axes][:, :width].astype(np.float32) / gyroscope_unit[:, None]
     return values
